@@ -20,6 +20,14 @@
 - [业务字段清洗流水线](#业务字段清洗流水线)
 - [多维表字段映射](#多维表字段映射)
 - [幂等性保证](#幂等性保证)
+- [RAG 知识库](#rag-知识库)
+  - [架构概览](#架构概览)
+  - [知识目录结构](#知识目录结构)
+  - [模块说明](#模块说明)
+  - [索引构建](#索引构建)
+  - [API 用法](#api-用法)
+  - [Embedding 后端配置](#embedding-后端配置)
+  - [单元测试](#单元测试)
 
 ---
 
@@ -95,9 +103,27 @@ ppg_wh_agent/
 │   ├── seen_mails.py          # 已读邮件 UID 持久化
 │   └── config.py              # 配置加载
 │
+├── rag/                       # RAG 知识库模块
+│   ├── __init__.py
+│   ├── rag_pipeline.py        # RAG 总入口（build / query / explain）
+│   ├── build_index.py         # 索引构建 CLI 工具
+│   ├── document_loader.py     # 知识文档加载 & Markdown Chunking
+│   ├── embedder.py            # Embedding 封装（local / openai）
+│   ├── vector_store.py        # ChromaDB 向量库封装
+│   └── retriever.py           # 语义检索（相似度过滤 & category 过滤）
+│
+├── knowledge/                 # 知识文档目录（Markdown，按分类存放）
+│   ├── transport_modes/       # 发运方式相关知识
+│   ├── goods_classification/  # 危险品 / 货物分类知识
+│   └── sop/                   # 标准操作规程
+│
+├── test/
+│   └── test_rag.py            # RAG 单元测试
+│
 ├── file/                      # PDF 附件保存目录
 ├── output/
 │   ├── orders_YYYY-MM-DD.json           # 每日排序后的待同步订单
+│   ├── rag_index/                       # RAG 向量索引持久化目录（ChromaDB）
 │   └── cache/
 │       ├── shipping_YYYY-MM-DD.json     # 每日发运缓存快照
 │       ├── shipping_all.json            # 全量历史发运缓存（累积合并）
@@ -306,3 +332,181 @@ LogisticsNormalizer.normalize_danger    # 危险品类别识别
 - **订单去重**：`PendingOrdersManager.add_orders` 按 `order_no` 去重，`synced` 订单内容无变化时不覆盖
 - **多维表写入**：`sync_orders.py` 每次先建立「单号 → record_id」映射，已取消/已更新走 `batch_update_records`，不产生重复行
 - **发运缓存**：其他人 SHIPPING_INFO 邮件首次写入后不覆盖，防止重复运行污染数据
+
+---
+
+## RAG 知识库
+
+`rag/` 模块为物流业务字段清洗提供**语义检索兜底能力**。当规则引擎无法覆盖某些长尾场景时，RAG 通过向量相似度在知识文档中检索最相关片段，辅助推断发运方式、危险品类别和 SOP 操作提醒。
+
+> **定位**：RAG 结果以 `_rag_hint` 字段形式输出，仅作参考，**不直接覆盖**由规则引擎写入的核心字段。
+
+---
+
+### 架构概览
+
+```
+knowledge/（Markdown 文档）
+    │
+    ▼
+document_loader.py   ── 递归加载 .md，按标题（H1/H2）Chunking
+    │
+    ▼
+embedder.py          ── Embedding（local: MiniLM-L12 | openai: text-embedding-3-small）
+    │
+    ▼
+vector_store.py      ── ChromaDB 持久化（output/rag_index/）
+    │
+    ▼
+retriever.py         ── 余弦相似度检索 + category 过滤 + score_threshold 过滤
+    │
+    ▼
+rag_pipeline.py      ── 统一入口：build() / query() / explain(order_dict)
+```
+
+---
+
+### 知识目录结构
+
+知识文档存放在 `knowledge/` 目录下，按业务分类组织：
+
+| 子目录 | category 标签 | 内容 |
+|--------|--------------|------|
+| `transport_modes/` | `transport_modes` | 零担、整车、保温车、包车、自提等发运方式规则 |
+| `goods_classification/` | `goods_classification` | 危险品类别、包装等级、化学品识别规则 |
+| `sop/` | `sop` | 标准操作规程、特殊客户操作提醒 |
+
+- 文件格式：`.md`（UTF-8）
+- Chunking 策略：按 `##`（H2）及以上标题切割，短片段（< 60 字符）自动合并到下一 Chunk
+- 每个 Chunk 附带 `chunk_id / source_file / category / heading` 元数据
+
+**扩展知识库**：在对应子目录下新增 `.md` 文件后，重新运行索引构建命令即可。
+
+---
+
+### 模块说明
+
+| 文件 | 说明 |
+|------|------|
+| `rag_pipeline.py` | RAG 总入口，单例懒加载，提供 `build()` / `query()` / `explain()` 三个方法 |
+| `build_index.py` | 索引构建 CLI，支持全量重建（`--rebuild`）和交互式测试（`--test`） |
+| `document_loader.py` | 递归扫描 `knowledge/`，Markdown 标题 Chunking，输出带 Metadata 的 Chunk 列表 |
+| `embedder.py` | Embedding 统一接口，支持本地 `sentence-transformers` 和 OpenAI API 两种后端 |
+| `vector_store.py` | ChromaDB 向量库封装，支持 `upsert`（增量更新）/ `clear`（清空）/ `count` |
+| `retriever.py` | 语义检索，支持 `category` 元数据过滤和 `score_threshold` 相似度阈值过滤 |
+
+---
+
+### 索引构建
+
+**首次使用前必须先构建索引。** 之后每次更新 `knowledge/` 文档时按需重建。
+
+```bash
+# 安装依赖（如未安装）
+pip install chromadb>=0.4.0 sentence-transformers>=2.2.0
+
+# 全量重建（清空旧索引后重新构建，推荐首次或文档大量变更时使用）
+python rag/build_index.py --rebuild
+
+# 增量更新（仅追加/覆盖有变化的 Chunk）
+python rag/build_index.py
+
+# 构建后进入交互式查询测试
+python rag/build_index.py --rebuild --test
+```
+
+交互式测试支持按 `category` 过滤（`transport_modes` / `goods_classification` / `sop` / 回车=全库），输入 `q` 退出。
+
+索引文件持久化至 `output/rag_index/`（ChromaDB 格式），无需每次重建。
+
+---
+
+### API 用法
+
+#### 单次语义检索
+
+```python
+from rag.rag_pipeline import RAGPipeline
+
+rag = RAGPipeline()
+
+# category 可选：transport_modes / goods_classification / sop / None（全库）
+hits = rag.query("零担运输危险品", category="transport_modes", top_k=3)
+
+for hit in hits:
+    print(hit["score"])            # 余弦相似度 [0, 1]
+    print(hit["text"])             # Chunk 正文
+    print(hit["metadata"])         # {category, source_file, heading}
+```
+
+#### 订单综合推断
+
+```python
+order = {
+    "address":      "上海市浦东新区某路1号",
+    "requirement":  "保温车运输，冬季防冻",
+    "company_name": "上汽大众",
+    "weight":       "1500",
+    "发运方式":     "",
+}
+
+hints = rag.explain(order)
+# 返回：
+# {
+#   "shipping_rag_hint": "...",   # 发运方式推断参考
+#   "danger_rag_hint":   "...",   # 危险品类别参考
+#   "sop_rag_hint":      "...",   # SOP 操作提醒
+# }
+```
+
+`explain()` 内部执行三次 `query()`：
+
+| hint 字段 | 查询来源 | category 过滤 |
+|-----------|---------|---------------|
+| `shipping_rag_hint` | `requirement + address + weight + 发运方式` | `transport_modes` |
+| `danger_rag_hint` | `company_name + requirement + 危险品类别` | `goods_classification` |
+| `sop_rag_hint` | `requirement + address + 发运方式 + 危险品类别` | `sop` |
+
+---
+
+### Embedding 后端配置
+
+在 `.env` 中配置（默认使用本地模型，无需联网）：
+
+```env
+# local（默认）：使用 sentence-transformers，离线运行，约 120MB
+EMBEDDING_BACKEND=local
+
+# openai：使用 text-embedding-3-small，需配置 API Key
+# EMBEDDING_BACKEND=openai
+# OPENAI_API_KEY=<your-api-key>
+```
+
+| 后端 | 模型 | 向量维度 | 是否需要联网 |
+|------|------|---------|-------------|
+| `local`（默认） | `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 否（首次自动下载模型） |
+| `openai` | `text-embedding-3-small` | 1536 | 是 |
+
+> 本地模型支持中英文混合，适合当前物流业务场景，**推荐使用默认 local 后端**。
+
+---
+
+### 单元测试
+
+```bash
+# 使用 pytest
+python -m pytest test/test_rag.py -v
+
+# 或直接运行
+python test/test_rag.py
+```
+
+测试覆盖以下用例：
+
+| 测试类 | 测试内容 |
+|--------|----------|
+| `TestDocumentLoader` | 知识目录存在性、Chunk 加载非空、Chunk 字段完整性、三个 category 均存在、无空 text |
+| `TestEmbedder` | 单条/批量 embed 输出、向量维度一致性、空输入处理 |
+| `TestRAGPipeline` | 索引构建后 count > 0、相关查询有结果、结果结构、score 范围、category 过滤、空字符串容错、`explain()` 字段完整性 |
+
+> `TestEmbedder` 和 `TestRAGPipeline` 在缺少 `sentence-transformers` / `chromadb` 时自动跳过，不影响其他测试。
