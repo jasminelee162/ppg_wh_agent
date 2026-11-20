@@ -1,445 +1,447 @@
+[中文](README-ZH.md) | English
+
 # PPG WH Agent
 
-> 自动化邮件解析与飞书多维表同步系统，专用于 PPG 芜湖仓库的每日发运订单处理。
+> An automated email parsing and Feishu (Lark) Bitable synchronization system designed for daily shipping-order processing at the PPG Wuhu Warehouse.
 
 ---
 
-## 目录
+## Table of Contents
 
-- [系统概述](#系统概述)
-- [整体架构](#整体架构)
-- [目录结构](#目录结构)
-- [环境配置](#环境配置)
-- [运行说明](#运行说明)
-- [核心流程详解](#核心流程详解)
-  - [邮件处理（main.py）](#邮件处理mainpy)
-  - [多维表同步（sync_orders.py）](#多维表同步sync_orderspy)
-- [业务指令处理](#业务指令处理)
-- [发运方式缓存（Shipping Cache）](#发运方式缓存shipping-cache)
-- [暂存区（PendingOrders）](#暂存区pendingorders)
-- [业务字段清洗流水线](#业务字段清洗流水线)
-- [多维表字段映射](#多维表字段映射)
-- [幂等性保证](#幂等性保证)
-- [RAG 知识库](#rag-知识库)
-  - [架构概览](#架构概览)
-  - [知识目录结构](#知识目录结构)
-  - [模块说明](#模块说明)
-  - [索引构建](#索引构建)
-  - [API 用法](#api-用法)
-  - [Embedding 后端配置](#embedding-后端配置)
-  - [单元测试](#单元测试)
-
----
-
-## 系统概述
-
-本系统每日自动完成以下工作：
-
-1. **拉取邮件** —— 通过 IMAP 拉取邮箱全部邮件
-2. **更新发运缓存** —— 从 wenjuan / SHIPPING_INFO 邮件中提取发运方式与危险品信息，持久化到 `shipping_all.json`
-3. **识别业务指令** —— 解析邮件正文，自动执行取消、改单、拆单等操作
-4. **解析 PDF 发货单** —— 提取订单号、地址、重量、数量、联系人等字段
-5. **规范化字段** —— 通过多级清洗流水线标准化地址、联系人、发运方式等
-6. **写入暂存区** —— 新订单写入 `pending_orders.json` 暂存
-7. **同步飞书多维表** —— 将暂存区订单批量写入飞书多维表，同步取消/改单等状态变更
+- [System Overview](#system-overview)
+- [Architecture](#architecture)
+- [Directory Structure](#directory-structure)
+- [Environment Configuration](#environment-configuration)
+- [Usage](#usage)
+- [Core Workflows](#core-workflows)
+  - [Email Processing (`main.py`)](#email-processing-mainpy)
+  - [Bitable Synchronization (`sync_orders.py`)](#bitable-synchronization-sync_orderspy)
+- [Business Instruction Handling](#business-instruction-handling)
+- [Shipping Cache](#shipping-cache)
+- [Staging Area (`PendingOrders`)](#staging-area-pendingorders)
+- [Field Normalization Pipeline](#field-normalization-pipeline)
+- [Bitable Field Mapping](#bitable-field-mapping)
+- [Idempotency Guarantees](#idempotency-guarantees)
+- [RAG Knowledge Base](#rag-knowledge-base)
+  - [Architecture Overview](#architecture-overview)
+  - [Knowledge Directory Structure](#knowledge-directory-structure)
+  - [Module Descriptions](#module-descriptions)
+  - [Index Building](#index-building)
+  - [API Usage](#api-usage)
+  - [Embedding Backend Configuration](#embedding-backend-configuration)
+  - [Unit Tests](#unit-tests)
 
 ---
 
-## 整体架构
+## System Overview
 
-```
-邮件 (IMAP)
+This system automates the following daily workflow:
+
+1. **Fetch Emails** — Pulls all emails from the inbox via IMAP.
+2. **Update Shipping Cache** — Extracts transport modes and hazmat (dangerous goods) information from `wenjuan` / `SHIPPING_INFO` emails and persists them to `shipping_all.json`.
+3. **Detect Business Instructions** — Parses email bodies to automatically handle order cancellations, modifications, and splits.
+4. **Parse PDF Shipping Orders** — Extracts structured fields including order numbers, addresses, weights, quantities, and contacts.
+5. **Normalize Fields** — Standardizes addresses, contacts, transport modes, and other fields through a multi-stage deterministic normalization pipeline.
+6. **Stage Orders** — Writes newly parsed orders to `pending_orders.json`.
+7. **Sync to Feishu Bitable** — Batch-writes staged orders to Feishu Bitable and synchronizes status updates such as cancellations and modifications.
+
+---
+
+## Architecture
+
+```text
+Emails (IMAP)
     │
     ▼
 main.py
-    ├── 1. 更新 Shipping Cache（wenjuan / SHIPPING_INFO 邮件）
-    ├── 2. 识别业务指令（取消 / 改单 / 拆单）
-    └── 3. 解析 PDF_ORDER → FieldNormalizer → PendingOrdersManager
+    ├── 1. Update Shipping Cache (wenjuan / SHIPPING_INFO emails)
+    ├── 2. Detect Business Instructions (Cancel / Modify / Split)
+    └── 3. Parse PDF_ORDER → FieldNormalizer → PendingOrdersManager
 
 sync_orders.py
-    ├── 处理 已取消 → 修改多维表状态
-    ├── 处理 已更新 → 覆盖多维表记录
-    ├── 写入 pending / 拆单 → 新增多维表行
-    └── 输出 output/orders_YYYY-MM-DD.json
+    ├── Process Cancelled ("已取消") → Update Bitable status
+    ├── Process Updated ("已更新") → Overwrite existing Bitable records
+    ├── Write pending / Split ("拆单") → Insert new Bitable rows
+    └── Export output/orders_YYYY-MM-DD.json
 ```
 
 ---
 
-## 目录结构
+## Directory Structure
 
-```
+```text
 ppg_wh_agent/
-├── main.py                    # 邮件拉取 & 解析主入口
-├── sync_orders.py             # 多维表写入入口
-├── inspect_orders.py          # 暂存区查询工具（开发辅助）
+├── main.py                    # Main entry point for email fetching & parsing
+├── sync_orders.py             # Entry point for Bitable synchronization
+├── inspect_orders.py          # Staging area inspection tool (dev helper)
 ├── requirements.txt
-├── .env                       # 环境变量（密钥等，不入库）
+├── .env                       # Environment variables & secrets (gitignored)
 │
 ├── mail/
-│   ├── mail_reader.py         # IMAP 邮件拉取
-│   ├── mail_filter.py         # 邮件类型识别（PDF_ORDER / SHIPPING_INFO / …）
-│   └── email_saver.py         # 附件保存
+│   ├── mail_reader.py         # IMAP email fetcher
+│   ├── mail_filter.py         # Email classification (PDF_ORDER / SHIPPING_INFO / …)
+│   └── email_saver.py         # Attachment downloader
 │
 ├── parser/
-│   ├── pdf_parser.py          # PDF 文本提取 + 坐标层精确单号提取
-│   ├── content_parser.py      # 正文/PDF 文本字段解析
-│   └── schema.py              # 字段 schema 定义
+│   ├── pdf_parser.py          # PDF text extraction + coordinate-based order number extraction
+│   ├── content_parser.py      # Email body / PDF text field parser
+│   └── schema.py              # Field schema definitions
 │
 ├── business/
-│   ├── field_normalizer.py    # 业务清洗流水线总控
-│   ├── rule_engine.py         # 规则引擎
+│   ├── field_normalizer.py    # Normalization pipeline orchestrator
+│   ├── rule_engine.py         # Deterministic rule engine
 │   └── normalizers/
-│       ├── order_info_normalizer.py   # 日期规范化
-│       ├── requirement_normalizer.py  # 客户要求清洗
-│       ├── contact_normalizer.py      # 联系人清洗
-│       ├── address_normalizer.py      # 地址规范化 / 收货单位匹配 / 到货省市
-│       └── logistics_normalizer.py    # 发运方式 & 危险品类别
+│       ├── order_info_normalizer.py   # Date standardization
+│       ├── requirement_normalizer.py  # Customer requirement denoising
+│       ├── contact_normalizer.py      # Contact cleaning & phone extraction
+│       ├── address_normalizer.py      # Address normalization / consignee matching / province & city
+│       └── logistics_normalizer.py    # Transport mode & hazmat classification
 │
 ├── feishu/
-│   └── bitable.py             # 飞书多维表 API 封装
+│   └── bitable.py             # Feishu Bitable API wrapper
 │
 ├── utils/
 │   ├── cache_manager.py       # CacheManager / PendingOrdersManager / OrdersManager
-│   ├── seen_mails.py          # 已读邮件 UID 持久化
-│   └── config.py              # 配置加载
+│   ├── seen_mails.py          # Processed email UID persistence
+│   └── config.py              # Configuration loader
 │
-├── rag/                       # RAG 知识库模块
+├── rag/                       # RAG knowledge base module
 │   ├── __init__.py
-│   ├── rag_pipeline.py        # RAG 总入口（build / query / explain）
-│   ├── build_index.py         # 索引构建 CLI 工具
-│   ├── document_loader.py     # 知识文档加载 & Markdown Chunking
-│   ├── embedder.py            # Embedding 封装（local / openai）
-│   ├── vector_store.py        # ChromaDB 向量库封装
-│   └── retriever.py           # 语义检索（相似度过滤 & category 过滤）
+│   ├── rag_pipeline.py        # Unified RAG entry point (build / query / explain)
+│   ├── build_index.py         # CLI tool for building the vector index
+│   ├── document_loader.py     # Knowledge document loader & Markdown chunking
+│   ├── embedder.py            # Embedding wrapper (local / openai)
+│   ├── vector_store.py        # ChromaDB vector store wrapper
+│   └── retriever.py           # Semantic retrieval (similarity & category filtering)
 │
-├── knowledge/                 # 知识文档目录（Markdown，按分类存放）
-│   ├── transport_modes/       # 发运方式相关知识
-│   ├── goods_classification/  # 危险品 / 货物分类知识
-│   └── sop/                   # 标准操作规程
+├── knowledge/                 # Domain knowledge documents (Markdown, organized by category)
+│   ├── transport_modes/       # Transport mode rules
+│   ├── goods_classification/  # Hazmat / goods classification rules
+│   └── sop/                   # Standard Operating Procedures (SOPs)
 │
 ├── test/
-│   └── test_rag.py            # RAG 单元测试
+│   └── test_rag.py            # RAG unit tests
 │
-├── file/                      # PDF 附件保存目录
+├── file/                      # Directory for saved PDF attachments
 ├── output/
-│   ├── orders_YYYY-MM-DD.json           # 每日排序后的待同步订单
-│   ├── rag_index/                       # RAG 向量索引持久化目录（ChromaDB）
+│   ├── orders_YYYY-MM-DD.json           # Daily sorted orders ready for sync
+│   ├── rag_index/                       # Persisted RAG vector index (ChromaDB)
 │   └── cache/
-│       ├── shipping_YYYY-MM-DD.json     # 每日发运缓存快照
-│       ├── shipping_all.json            # 全量历史发运缓存（累积合并）
-│       └── pending_orders.json          # 暂存区（所有状态订单）
-└── WH_check/                  # 其他检查脚本（独立工具）
+│       ├── shipping_YYYY-MM-DD.json     # Daily shipping cache snapshot
+│       ├── shipping_all.json            # Cumulative historical shipping cache
+│       └── pending_orders.json          # Staging area (orders across all statuses)
+└── WH_check/                  # Standalone verification scripts
 ```
 
 ---
 
-## 环境配置
+## Environment Configuration
 
-复制并填写 `.env` 文件：
+Copy and populate the `.env` file:
 
 ```env
-# 邮件（IMAP）
+# Email (IMAP)
 MAIL_HOST=imap.feishu.cn
 MAIL_PORT=993
-MAIL_USER=<邮箱账号>
-MAIL_PASSWORD=<邮箱密码>
+MAIL_USER=<email_account>
+MAIL_PASSWORD=<email_password>
 
-# 飞书多维表
-FEISHU_APP_ID=<应用 ID>
-FEISHU_APP_SECRET=<应用密钥>
-FEISHU_BITABLE_APP_TOKEN=<多维表 App Token>
-FEISHU_BITABLE_TABLE_ID=<订单表 Table ID>
-FEISHU_RECEIVER_TABLE_ID=<收货方表 Table ID>
+# Feishu Bitable
+FEISHU_APP_ID=<app_id>
+FEISHU_APP_SECRET=<app_secret>
+FEISHU_BITABLE_APP_TOKEN=<bitable_app_token>
+FEISHU_BITABLE_TABLE_ID=<orders_table_id>
+FEISHU_RECEIVER_TABLE_ID=<receivers_table_id>
 ```
 
-安装依赖：
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> `jionlp` 会在首次运行 `main.py` 时自动检测并安装（优先清华源，失败后尝试阿里源）。
+> `jionlp` is automatically detected and installed on the first run of `main.py` (attempting the Tsinghua PyPI mirror first, with Alibaba Cloud mirror as fallback).
 
 ---
 
-## 运行说明
+## Usage
 
-### 步骤一：邮件解析
+### Step 1: Email Parsing
 
 ```bash
 python main.py
 ```
 
-- 拉取邮箱全部邮件（`ALL`），自动跳过已处理 UID
-- 更新发运缓存，识别并执行业务指令
-- 将新 PDF 订单写入 `pending_orders.json`
+- Fetches all emails (`ALL`) via IMAP and automatically skips previously processed UIDs.
+- Updates the shipping cache and detects/executes business instructions.
+- Writes newly parsed PDF orders to `pending_orders.json`.
 
-### 步骤二：同步多维表
+### Step 2: Bitable Synchronization
 
 ```bash
 python sync_orders.py
 ```
 
-- 读取 `pending_orders.json` 中所有待处理订单
-- 按状态分批处理：取消 → 改单覆盖 → 新增
-- 输出 `output/orders_YYYY-MM-DD.json` 并标记 `synced`
+- Reads all pending orders from `pending_orders.json`.
+- Processes records in batches by status: Cancel → Overwrite Updated → Insert New.
+- Exports `output/orders_YYYY-MM-DD.json` and marks records as `synced`.
 
 ---
 
-## 核心流程详解
+## Core Workflows
 
-### 邮件处理（main.py）
+### Email Processing (`main.py`)
 
+```text
+Fetch all emails (up to 3 retries)
+    │
+    ├─ Pass 1 (all emails): Update Shipping Cache
+    │       ├─ wenjuan emails (empty body + PDF): extract transport mode from subject, write/overwrite cache
+    │       └─ SHIPPING_INFO emails: write on first seen, do not overwrite
+    │
+    ├─ Pass 2: Detect Business Instructions
+    │       ├─ Contains cancel keywords ("取消/停止/作废/不用发") → mark as "已取消" (Cancelled)
+    │       ├─ Contains update keywords ("更新/以此为准/重新提供") → parse PDF → mark as "已更新" (Updated)
+    │       └─ Contains split keyword ("拆") & ≥ 2 PDF attachments → original as "已更新", child as "拆单" (Split)
+    │
+    └─ Pass 3 (skip seen UIDs): Parse PDF_ORDER
+            ├─ save_attachments → save PDFs to file/
+            ├─ PDFParser.parse_pdf + extract_order_no_coord → text + coordinate-based order number
+            ├─ ContentParser.parse_pdf_text → raw field dict
+            ├─ FieldNormalizer.normalize → deterministic business normalization
+            └─ PendingOrdersManager.add_orders → write to staging area
 ```
-拉取全部邮件（最多重试 3 次）
-    │
-    ├─ 遍历一（不限已读）：更新 Shipping Cache
-    │       ├─ wenjuan 邮件（无正文 + 有 PDF）：从标题提取发运方式，写入/覆盖缓存
-    │       └─ SHIPPING_INFO 邮件：首次写入，不覆盖
-    │
-    ├─ 遍历二：识别业务指令
-    │       ├─ 含"取消/停止/作废/不用发"→ 标记 已取消
-    │       ├─ 含"更新/以此为准/重新提供"→ 解析 PDF → 标记 已更新
-    │       └─ 含"拆"且附件 >= 2 个 PDF → 原单 已更新 + 子单 拆单
-    │
-    └─ 遍历三（跳过已读 UID）：解析 PDF_ORDER
-            ├─ save_attachments → 保存 PDF 到 file/
-            ├─ PDFParser.parse_pdf + extract_order_no_coord → 文本 + 坐标层单号
-            ├─ ContentParser.parse_pdf_text → 原始字段 dict
-            ├─ FieldNormalizer.normalize → 业务清洗
-            └─ PendingOrdersManager.add_orders → 写入暂存区
-```
 
-**回复链截断**：邮件正文在送入业务指令识别前，会在"回复/转发链"起始处截断，确保指令识别仅基于新邮件内容。支持识别以下格式：
+**Reply Chain Truncation**: Before running business instruction detection, email bodies are truncated at the start of any reply/forward chain to ensure instructions are parsed strictly from the latest message. Supported headers include:
 - `-----Original Message-----`
-- Outlook/飞书英文转发头（`From: … Sent: …`）
-- 中文转发头（`发件人: … 发送时间: …`）
+- English Outlook/Feishu forward headers (`From: … Sent: …`)
+- Chinese forward headers (`发件人: … 发送时间: …`)
 
 ---
 
-### 多维表同步（sync_orders.py）
+### Bitable Synchronization (`sync_orders.py`)
 
-```
-加载 pending_orders.json
+```text
+Load pending_orders.json
     │
-    ├─ 构建「单号 → record_id」映射（拉取多维表全量记录）
+    ├─ Build "order_no → record_id" mapping (fetch all existing Bitable records)
     │
-    ├─ 已取消：batch_update_records → 仅改状态字段为"已取消"
-    ├─ 已更新（多维表已有记录）：batch_update_records → 覆盖全字段
-    ├─ pending / 拆单 / 已更新（无记录）：write_records → 新增行
+    ├─ Cancelled ("已取消"): batch_update_records → update status field only
+    ├─ Updated ("已更新", existing record): batch_update_records → overwrite all fields
+    ├─ pending / Split ("拆单") / Updated (no existing record): write_records → insert new rows
     │
-    ├─ 输出 output/orders_YYYY-MM-DD.json（按省市/地址/单号排序）
-    └─ mark_synced → 更新暂存区状态为 synced
+    ├─ Export output/orders_YYYY-MM-DD.json (sorted by province/city, address, order_no)
+    └─ mark_synced → update staging area status to synced
 ```
 
-无法解析日期的订单自动标记为 `anomaly`，跳过本次写入。
+Orders with unparseable dates are automatically flagged as `anomaly` and skipped during synchronization.
 
 ---
 
-## 业务指令处理
+## Business Instruction Handling
 
-| 指令类型 | 触发关键词（新邮件正文或主题） | 处理逻辑 |
-|--------|--------------------------|---------|
-| **取消** | 停止、作废、不用发、取消 | 从正文（截断后）+ 主题提取单号，设 `sync_status = 已取消` |
-| **改单** | 更新、以此为准、重新提供 | 解析附件 PDF，用新字段覆盖暂存区，设 `sync_status = 已更新` |
-| **拆单** | 拆（正文或主题）+ 附件 ≥ 2 个 PDF | 第一个 PDF 更新原单（已更新），第二个 PDF 新增子单（拆单），子单号若与原单相同则附 `-1` 后缀 |
-
----
-
-## 发运方式缓存（Shipping Cache）
-
-- **写入规则**：
-  - `wenjuan` 发送（无正文 + 有 PDF 附件）：从**标题**提取发运方式（零担/保温车/包车/自提），**覆盖**已有记录
-  - 其他人的 `SHIPPING_INFO` 邮件：解析正文表格，**首次写入**，不覆盖
-- **存储路径**：
-  - `output/cache/shipping_YYYY-MM-DD.json`（每日快照）
-  - `output/cache/shipping_all.json`（全量历史累积，merge 写入不删历史）
-- **使用时机**：解析 PDF 后，若字段未能提取到发运方式/危险品，从缓存补充
+| Instruction Type | Trigger Keywords (New Body or Subject) | Handling Logic |
+|------------------|----------------------------------------|----------------|
+| **Cancel** | 停止, 作废, 不用发, 取消 | Extracts order numbers from truncated body + subject; sets `sync_status = 已取消`. |
+| **Modify** | 更新, 以此为准, 重新提供 | Parses attached PDF, overwrites staged fields, and sets `sync_status = 已更新`. |
+| **Split** | 拆 (body or subject) + ≥ 2 PDF attachments | First PDF updates the original order (`已更新`); second PDF creates a child order (`拆单`), appending `-1` if the order number matches the parent. |
 
 ---
 
-## 暂存区（PendingOrders）
+## Shipping Cache
 
-文件路径：`output/cache/pending_orders.json`
-
-格式：`{ order_no: { ...字段..., sync_status, synced_at } }`
-
-| `sync_status` | 含义 |
-|-------------|------|
-| `pending` | 尚未写入多维表 |
-| `synced` | 已成功写入多维表 |
-| `已更新` | 改单，待覆盖多维表已有记录 |
-| `已取消` | 已取消，待修改多维表状态字段 |
-| `拆单` | 拆分子单，待新增至多维表 |
-| `anomaly` | 日期无法解析，异常跳过 |
-
-**`add_orders` 合并规则**：
-
-| 已有状态 | 新数据情况 | 结果 |
-|---------|----------|------|
-| 不存在 | 任意 | 新增，`pending` |
-| `synced` | 内容有变化 | 覆盖，设为 `已更新` |
-| `synced` | 内容无变化 | 保持不变 |
-| `pending` | 任意 | 直接覆盖 |
-| `anomaly` / `已取消` | 任意 | 保持不变，不覆盖 |
+- **Write Rules**:
+  - Emails from `wenjuan` (empty body + PDF attachment): extracts transport mode (LTL / Temperature-Controlled / Chartered / Self-Pickup) from the **subject** and **overwrites** existing entries.
+  - `SHIPPING_INFO` emails from other senders: parses body tables and writes on **first seen** without overwriting.
+- **Storage Paths**:
+  - `output/cache/shipping_YYYY-MM-DD.json` (daily snapshot)
+  - `output/cache/shipping_all.json` (cumulative history; merged without deleting past entries)
+- **Usage**: After PDF parsing, if transport mode or hazmat classification is missing, values are backfilled from the cache.
 
 ---
 
-## 业务字段清洗流水线
+## Staging Area (`PendingOrders`)
 
-`FieldNormalizer.normalize()` 按以下顺序执行：
+File path: `output/cache/pending_orders.json`
 
+Format: `{ order_no: { ...fields..., sync_status, synced_at } }`
+
+| `sync_status` | Meaning |
+|---------------|---------|
+| `pending` | Not yet written to Bitable |
+| `synced` | Successfully synced to Bitable |
+| `已更新` | Modified order awaiting overwrite in Bitable |
+| `已取消` | Cancelled order awaiting status update in Bitable |
+| `拆单` | Split child order awaiting insertion into Bitable |
+| `anomaly` | Unparseable date; skipped as an exception |
+
+**`add_orders` Merge Rules**:
+
+| Existing Status | Incoming Data | Outcome |
+|-----------------|---------------|---------|
+| Not present | Any | Insert as `pending` |
+| `synced` | Content changed | Overwrite and set to `已更新` |
+| `synced` | No change | Keep unchanged |
+| `pending` | Any | Overwrite directly |
+| `anomaly` / `已取消` | Any | Keep unchanged (do not overwrite) |
+
+---
+
+## Field Normalization Pipeline
+
+`FieldNormalizer.normalize()` executes the following stages sequentially:
+
+```text
+OrderInfoNormalizer.normalize_date      # Date standardization (→ YYYY/MM/DD)
+RequirementNormalizer.normalize         # Customer requirement denoising
+ContactNormalizer.normalize             # Contact cleaning & phone number extraction
+AddressNormalizer.normalize_address     # Address normalization (exact / fuzzy matching)
+AddressNormalizer.normalize_receiver    # Receiving unit (consignee) matching
+AddressNormalizer.normalize_city        # Destination province & city extraction (jionlp NLP)
+LogisticsNormalizer.normalize_shipping  # Transport mode standardization
+LogisticsNormalizer.normalize_danger    # Hazmat category identification
 ```
-OrderInfoNormalizer.normalize_date      # 日期规范化（→ YYYY/MM/DD）
-RequirementNormalizer.normalize         # 客户要求去噪清洗
-ContactNormalizer.normalize             # 联系人去噪、手机号提取
-AddressNormalizer.normalize_address     # 地址规范化（精确/模糊匹配）
-AddressNormalizer.normalize_receiver    # 收货单位匹配
-AddressNormalizer.normalize_city        # 到货省市提取（jionlp NLP）
-LogisticsNormalizer.normalize_shipping  # 发运方式标准化
-LogisticsNormalizer.normalize_danger    # 危险品类别识别
-```
 
 ---
 
-## 多维表字段映射
+## Bitable Field Mapping
 
-| 飞书字段 | 来源 | 说明 |
-|---------|------|------|
-| 客户名 | 固定值 `"芜湖PPG"` | |
-| 单号 | `order_no` | |
-| 订单状态 | `sync_status` 映射 | 正常/已更新/已取消/拆单 |
-| 下单日期 | `order_date` | 转为 Unix 毫秒时间戳 |
-| 地址状态 | `address_exact_match` | 精确匹配/模糊匹配 |
-| 收货单位 | `receiver` | |
-| 收货公司名 | `company_name` | |
-| 收货地址 | `address` | |
-| 收货人 | `contact` | |
-| 客户要求 | `requirement` | |
-| 数量 | `quantity` | float |
-| 重量 | `weight` | float，去 KG 后缀 |
-| 发运方式 | `发运方式` | |
-| 始发城市 | 固定值 `"马鞍山库"` | |
-| 到货城市 | `到货城市` | |
-| 到货省份 | `到货省份` | |
-| 产品特性 | `危险品类别` | |
-
----
-
-## 幂等性保证
-
-- **邮件去重**：已处理 UID 持久化至 `output/cache/seen_mails.json`，重复运行自动跳过
-- **订单去重**：`PendingOrdersManager.add_orders` 按 `order_no` 去重，`synced` 订单内容无变化时不覆盖
-- **多维表写入**：`sync_orders.py` 每次先建立「单号 → record_id」映射，已取消/已更新走 `batch_update_records`，不产生重复行
-- **发运缓存**：其他人 SHIPPING_INFO 邮件首次写入后不覆盖，防止重复运行污染数据
+| Bitable Field (CN) | Source | Notes |
+|--------------------|--------|-------|
+| 客户名 (Client) | Constant `"芜湖PPG"` | |
+| 单号 (Order No.) | `order_no` | |
+| 订单状态 (Order Status) | Mapped from `sync_status` | Normal / Updated / Cancelled / Split |
+| 下单日期 (Order Date) | `order_date` | Converted to Unix timestamp (ms) |
+| 地址状态 (Address Match) | `address_exact_match` | Exact Match / Fuzzy Match |
+| 收货单位 (Receiving Unit) | `receiver` | |
+| 收货公司名 (Company Name) | `company_name` | |
+| 收货地址 (Address) | `address` | |
+| 收货人 (Contact) | `contact` | |
+| 客户要求 (Requirements) | `requirement` | |
+| 数量 (Quantity) | `quantity` | `float` |
+| 重量 (Weight) | `weight` | `float` (strips `KG` suffix) |
+| 发运方式 (Transport Mode) | `发运方式` | |
+| 始发城市 (Origin) | Constant `"马鞍山库"` | |
+| 到货城市 (Dest. City) | `到货城市` | |
+| 到货省份 (Dest. Province) | `到货省份` | |
+| 产品特性 (Product Property) | `危险品类别` | Hazmat category |
 
 ---
 
-## RAG 知识库
+## Idempotency Guarantees
 
-`rag/` 模块为物流业务字段清洗提供**语义检索兜底能力**。当规则引擎无法覆盖某些长尾场景时，RAG 通过向量相似度在知识文档中检索最相关片段，辅助推断发运方式、危险品类别和 SOP 操作提醒。
-
-> **定位**：RAG 结果以 `_rag_hint` 字段形式输出，仅作参考，**不直接覆盖**由规则引擎写入的核心字段。
+- **Email Deduplication**: Processed UIDs are persisted in `output/cache/seen_mails.json` and skipped on subsequent runs.
+- **Order Deduplication**: `PendingOrdersManager.add_orders` deduplicates by `order_no` and avoids overwriting unchanged `synced` records.
+- **Bitable Writes**: `sync_orders.py` builds an `order_no → record_id` index before syncing, routing cancellations and modifications through `batch_update_records` to prevent duplicate rows.
+- **Shipping Cache**: Non-`wenjuan` `SHIPPING_INFO` records are write-once to prevent repeated runs from corrupting historical data.
 
 ---
 
-### 架构概览
+## RAG Knowledge Base
 
-```
-knowledge/（Markdown 文档）
+The `rag/` module provides a **semantic retrieval fallback** for logistics field normalization. When deterministic rules cannot cover long-tail edge cases, the RAG pipeline retrieves the most relevant excerpts from internal knowledge documents via vector similarity to assist with transport mode inference, hazmat classification, and SOP reminders.
+
+> **Design Principle**: RAG outputs are emitted strictly as `_rag_hint` advisory fields and **never overwrite** core fields determined by the rule engine.
+
+---
+
+### Architecture Overview
+
+```text
+knowledge/ (Markdown documents)
     │
     ▼
-document_loader.py   ── 递归加载 .md，按标题（H1/H2）Chunking
+document_loader.py   ── Recursively loads .md files & chunks by headings (H1/H2)
     │
     ▼
-embedder.py          ── Embedding（local: MiniLM-L12 | openai: text-embedding-3-small）
+embedder.py          ── Embeddings (local: MiniLM-L12 | openai: text-embedding-3-small)
     │
     ▼
-vector_store.py      ── ChromaDB 持久化（output/rag_index/）
+vector_store.py      ── ChromaDB persistence (output/rag_index/)
     │
     ▼
-retriever.py         ── 余弦相似度检索 + category 过滤 + score_threshold 过滤
+retriever.py         ── Cosine similarity search + category & score_threshold filtering
     │
     ▼
-rag_pipeline.py      ── 统一入口：build() / query() / explain(order_dict)
+rag_pipeline.py      ── Unified interface: build() / query() / explain(order_dict)
 ```
 
 ---
 
-### 知识目录结构
+### Knowledge Directory Structure
 
-知识文档存放在 `knowledge/` 目录下，按业务分类组织：
+Knowledge documents are stored under `knowledge/` and organized by business category:
 
-| 子目录 | category 标签 | 内容 |
-|--------|--------------|------|
-| `transport_modes/` | `transport_modes` | 零担、整车、保温车、包车、自提等发运方式规则 |
-| `goods_classification/` | `goods_classification` | 危险品类别、包装等级、化学品识别规则 |
-| `sop/` | `sop` | 标准操作规程、特殊客户操作提醒 |
+| Subdirectory | `category` Tag | Content |
+|--------------|----------------|---------|
+| `transport_modes/` | `transport_modes` | Rules for LTL, FTL, temperature-controlled, chartered, and self-pickup transport |
+| `goods_classification/` | `goods_classification` | Hazmat categories, packaging groups, and chemical identification rules |
+| `sop/` | `sop` | Standard operating procedures and client-specific handling reminders |
 
-- 文件格式：`.md`（UTF-8）
-- Chunking 策略：按 `##`（H2）及以上标题切割，短片段（< 60 字符）自动合并到下一 Chunk
-- 每个 Chunk 附带 `chunk_id / source_file / category / heading` 元数据
+- **Format**: `.md` (UTF-8)
+- **Chunking Strategy**: Splits by `##` (H2) and higher headings; short fragments (< 60 characters) are automatically merged into the next chunk.
+- **Metadata**: Each chunk includes `chunk_id`, `source_file`, `category`, and `heading`.
 
-**扩展知识库**：在对应子目录下新增 `.md` 文件后，重新运行索引构建命令即可。
-
----
-
-### 模块说明
-
-| 文件 | 说明 |
-|------|------|
-| `rag_pipeline.py` | RAG 总入口，单例懒加载，提供 `build()` / `query()` / `explain()` 三个方法 |
-| `build_index.py` | 索引构建 CLI，支持全量重建（`--rebuild`）和交互式测试（`--test`） |
-| `document_loader.py` | 递归扫描 `knowledge/`，Markdown 标题 Chunking，输出带 Metadata 的 Chunk 列表 |
-| `embedder.py` | Embedding 统一接口，支持本地 `sentence-transformers` 和 OpenAI API 两种后端 |
-| `vector_store.py` | ChromaDB 向量库封装，支持 `upsert`（增量更新）/ `clear`（清空）/ `count` |
-| `retriever.py` | 语义检索，支持 `category` 元数据过滤和 `score_threshold` 相似度阈值过滤 |
+**Extending the Knowledge Base**: Add new `.md` files to the appropriate subdirectory and re-run the index builder.
 
 ---
 
-### 索引构建
+### Module Descriptions
 
-**首次使用前必须先构建索引。** 之后每次更新 `knowledge/` 文档时按需重建。
+| File | Description |
+|------|-------------|
+| `rag_pipeline.py` | Unified RAG entry point with lazy singleton initialization; exposes `build()`, `query()`, and `explain()`. |
+| `build_index.py` | CLI for index building, supporting full rebuilds (`--rebuild`) and interactive testing (`--test`). |
+| `document_loader.py` | Recursively scans `knowledge/`, chunks Markdown by headings, and emits chunks with metadata. |
+| `embedder.py` | Unified embedding interface supporting both local `sentence-transformers` and OpenAI API backends. |
+| `vector_store.py` | ChromaDB wrapper supporting `upsert` (incremental updates), `clear`, and `count`. |
+| `retriever.py` | Semantic retriever supporting `category` metadata filtering and `score_threshold` cutoffs. |
+
+---
+
+### Index Building
+
+**Build the index before first use**, and rebuild whenever documents under `knowledge/` are updated.
 
 ```bash
-# 安装依赖（如未安装）
+# Install dependencies (if not already installed)
 pip install chromadb>=0.4.0 sentence-transformers>=2.2.0
 
-# 全量重建（清空旧索引后重新构建，推荐首次或文档大量变更时使用）
+# Full rebuild (clears old index; recommended for initial setup or major updates)
 python rag/build_index.py --rebuild
 
-# 增量更新（仅追加/覆盖有变化的 Chunk）
+# Incremental update (upserts changed chunks only)
 python rag/build_index.py
 
-# 构建后进入交互式查询测试
+# Build and launch interactive query testing
 python rag/build_index.py --rebuild --test
 ```
 
-交互式测试支持按 `category` 过滤（`transport_modes` / `goods_classification` / `sop` / 回车=全库），输入 `q` 退出。
+Interactive mode supports filtering by `category` (`transport_modes` / `goods_classification` / `sop` / Enter for all). Type `q` to quit.
 
-索引文件持久化至 `output/rag_index/`（ChromaDB 格式），无需每次重建。
+The vector index is persisted to `output/rag_index/` (ChromaDB format) and does not need to be rebuilt on every run.
 
 ---
 
-### API 用法
+### API Usage
 
-#### 单次语义检索
+#### Single Semantic Query
 
 ```python
 from rag.rag_pipeline import RAGPipeline
 
 rag = RAGPipeline()
 
-# category 可选：transport_modes / goods_classification / sop / None（全库）
+# category options: "transport_modes" / "goods_classification" / "sop" / None (all)
 hits = rag.query("零担运输危险品", category="transport_modes", top_k=3)
 
 for hit in hits:
-    print(hit["score"])            # 余弦相似度 [0, 1]
-    print(hit["text"])             # Chunk 正文
+    print(hit["score"])            # Cosine similarity [0, 1]
+    print(hit["text"])             # Chunk content
     print(hit["metadata"])         # {category, source_file, heading}
 ```
 
-#### 订单综合推断
+#### Comprehensive Order Inference
 
 ```python
 order = {
@@ -451,62 +453,62 @@ order = {
 }
 
 hints = rag.explain(order)
-# 返回：
+# Returns:
 # {
-#   "shipping_rag_hint": "...",   # 发运方式推断参考
-#   "danger_rag_hint":   "...",   # 危险品类别参考
-#   "sop_rag_hint":      "...",   # SOP 操作提醒
+#   "shipping_rag_hint": "...",   # Transport mode advisory
+#   "danger_rag_hint":   "...",   # Hazmat classification advisory
+#   "sop_rag_hint":      "...",   # SOP handling reminder
 # }
 ```
 
-`explain()` 内部执行三次 `query()`：
+`explain()` internally executes three `query()` calls:
 
-| hint 字段 | 查询来源 | category 过滤 |
-|-----------|---------|---------------|
+| Hint Field | Query Source | Category Filter |
+|------------|--------------|-----------------|
 | `shipping_rag_hint` | `requirement + address + weight + 发运方式` | `transport_modes` |
 | `danger_rag_hint` | `company_name + requirement + 危险品类别` | `goods_classification` |
 | `sop_rag_hint` | `requirement + address + 发运方式 + 危险品类别` | `sop` |
 
 ---
 
-### Embedding 后端配置
+### Embedding Backend Configuration
 
-在 `.env` 中配置（默认使用本地模型，无需联网）：
+Configure in `.env` (defaults to the offline local model):
 
 ```env
-# local（默认）：使用 sentence-transformers，离线运行，约 120MB
+# local (default): uses sentence-transformers, runs offline (~120 MB)
 EMBEDDING_BACKEND=local
 
-# openai：使用 text-embedding-3-small，需配置 API Key
+# openai: uses text-embedding-3-small, requires an API key
 # EMBEDDING_BACKEND=openai
 # OPENAI_API_KEY=<your-api-key>
 ```
 
-| 后端 | 模型 | 向量维度 | 是否需要联网 |
-|------|------|---------|-------------|
-| `local`（默认） | `paraphrase-multilingual-MiniLM-L12-v2` | 384 | 否（首次自动下载模型） |
-| `openai` | `text-embedding-3-small` | 1536 | 是 |
+| Backend | Model | Dimensions | Internet Required |
+|---------|-------|------------|-------------------|
+| `local` (default) | `paraphrase-multilingual-MiniLM-L12-v2` | 384 | No (auto-downloads on first run) |
+| `openai` | `text-embedding-3-small` | 1536 | Yes |
 
-> 本地模型支持中英文混合，适合当前物流业务场景，**推荐使用默认 local 后端**。
+> The local model natively supports mixed Chinese-English text and is recommended for this logistics workflow.
 
 ---
 
-### 单元测试
+### Unit Tests
 
 ```bash
-# 使用 pytest
+# Run with pytest
 python -m pytest test/test_rag.py -v
 
-# 或直接运行
+# Or run directly
 python test/test_rag.py
 ```
 
-测试覆盖以下用例：
+Test coverage:
 
-| 测试类 | 测试内容 |
-|--------|----------|
-| `TestDocumentLoader` | 知识目录存在性、Chunk 加载非空、Chunk 字段完整性、三个 category 均存在、无空 text |
-| `TestEmbedder` | 单条/批量 embed 输出、向量维度一致性、空输入处理 |
-| `TestRAGPipeline` | 索引构建后 count > 0、相关查询有结果、结果结构、score 范围、category 过滤、空字符串容错、`explain()` 字段完整性 |
+| Test Class | Coverage |
+|------------|----------|
+| `TestDocumentLoader` | Directory existence, non-empty chunk loading, field integrity, presence of all three categories, non-empty text |
+| `TestEmbedder` | Single/batch embedding output, vector dimension consistency, empty input handling |
+| `TestRAGPipeline` | Post-build `count > 0`, relevant query hits, result schema, score bounds, category filtering, empty-string resilience, `explain()` field completeness |
 
-> `TestEmbedder` 和 `TestRAGPipeline` 在缺少 `sentence-transformers` / `chromadb` 时自动跳过，不影响其他测试。
+> `TestEmbedder` and `TestRAGPipeline` are automatically skipped if `sentence-transformers` or `chromadb` is not installed.
